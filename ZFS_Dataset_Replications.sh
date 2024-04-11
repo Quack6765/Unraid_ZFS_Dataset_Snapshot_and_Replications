@@ -1,4 +1,7 @@
 #!/bin/bash
+#
+# WIP DO NOT USE !
+#
 #set -x
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 # #   Script for snapshoting and/or replication a zfs dataset locally or remotely using zfs or rsync depending on the destination         # #
@@ -12,13 +15,13 @@
 #
 #Unraid notifications during process (sent to Unraid gui etc)
 notification_type="all"  # set to "all" for both success & failure, to "error"for only failure or "none" for no notices to be sent.
-notify_tune="yes"  # as well as a notifiction, if sucessful it will play the Mario "achievment tune" or failure StarWars imperial march tune on beep speaker!
+notify_tune="no"  # as well as a notifiction, if sucessful it will play the Mario "achievment tune" or failure StarWars imperial march tune on beep speaker!
                    # sometimes good to have an audiable notification!! Set to "no" for silence. (this function your server needs a beep speaker)
 #
 ####################
 # Source for snapshotting and/or replication
-source_pool="source_zfs_pool_name"  #this is the zpool in which your source dataset resides (note the does NOT start with /mnt/)
-source_dataset="dataset_name"   #this is the name of the dataset you want to snapshot and/or replicate
+source_pool="cache"  #this is the zpool in which your source dataset resides (note the does NOT start with /mnt/)
+source_dataset="appdata"   #this is the name of the dataset you want to snapshot and/or replicate
                                 #If using auto snapshots souce pool CAN NOT contain spaces. This is because sanoid config doesnt handle them
 #
 ####################
@@ -44,7 +47,7 @@ remote_server="10.10.20.197" #remote servers name or ip
 #
 ### replication settings
 #
-replication="zfs"   #this is set to the method for how you want to have the sourcedataset replicated - "zfs" , "rsync" or "none"
+replication="rsync"   #this is set to the method for how you want to have the sourcedataset replicated - "zfs" , "rsync" or "none"
 #
 ##########
 # zfs replication variables. You do NOT need these if replication set to "rsync" or "none"
@@ -58,8 +61,10 @@ syncoid_mode="strict-mirror"
 ##########
 #
 # rsync replication variables. You do not need these if replication set to zfs or no
-parent_destination_folder="/mnt/user/rsync_backup" # This is the parent directory in which a child directory will be created containing the replicated data (rsync)
-rsync_type="incremental" # set to "incremental" for dated incremental backups or "mirror" for mirrored backups
+parent_destination_folder="/mnt/user/backups" # This is the parent directory in which a child directory will be created containing the replicated data (rsync)
+rsync_type="mirror" # set to "incremental" for dated incremental backups or "mirror" for mirrored backups
+rsync_exclude=("config/Library/Application Support/Plex Media Server/Cache" "test") # list of path to exclude from the sync relative to the source dataset. In the format ("mypath1" "mypath2" "whatever else..")
+
 #
 ####################################################################################################
 #
@@ -382,7 +387,15 @@ get_previous_backup() {
 }
 #
 rsync_replication() {
-    local previous_backup  # declare variable 
+    local previous_backup  # declare variable
+    local rsync_exclude_args
+    
+    # Exclude user defined folders
+    if (( ${#rsync_exclude[@]} )); then
+      for i in "${rsync_exclude[@]}"; do
+        rsync_exclude_args+=( --exclude="$i" )
+      done
+    fi
 
     IFS=$'\n'
     if [ "$replication" = "rsync" ]; then
@@ -410,8 +423,8 @@ rsync_replication() {
                 [ "$rsync_type" = "incremental" ] && ssh "${remote_user}@${remote_server}" "mkdir -p \"${rsync_destination}\""
                 # Rsync the snapshot to the remote destination with link-dest
                 #rsync -azvvv --delete $link_dest -e ssh "${snapshot_mount_point}/" "${remote_user}@${remote_server}:${rsync_destination}/"
-                echo "Executing remote rsync: rsync -azvh --delete $link_dest -e ssh \"${snapshot_mount_point}/\" \"${remote_user}@${remote_server}:${rsync_destination}/\""
-rsync -azvh --delete $link_dest -e ssh "${snapshot_mount_point}/" "${remote_user}@${remote_server}:${rsync_destination}/"
+                echo "Executing remote rsync: rsync -azhp \"${rsync_exclude_args[@]}\" --delete $link_dest -e ssh \"${snapshot_mount_point}/\" \"${remote_user}@${remote_server}:${rsync_destination}/\""
+                rsync -azvph "${rsync_exclude_args[@]}" --delete $link_dest -e ssh "${snapshot_mount_point}/" "${remote_user}@${remote_server}:${rsync_destination}/"
 
                 if [ $? -ne 0 ]; then
                     unraid_notify "Rsync replication failed from source: ${source_path} to remote destination: ${remote_user}@${remote_server}:${rsync_destination}" "failure"
@@ -421,9 +434,9 @@ rsync -azvh --delete $link_dest -e ssh "${snapshot_mount_point}/" "${remote_user
                 # Ensure the backup directory exists
                 [ "$rsync_type" = "incremental" ] && mkdir -p "${rsync_destination}"
                 # Rsync the snapshot to the local destination with link-dest
-              #  rsync -avv --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/"
-              echo "Executing local rsync: rsync -avh --delete $link_dest \"${snapshot_mount_point}/\" \"${rsync_destination}/\""
-rsync -avh --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/"
+                #  rsync -avv --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/"
+                echo "Executing local rsync: rsync -ahvp \"${rsync_exclude_args[@]}\" --delete $link_dest \"${snapshot_mount_point}/\" \"${rsync_destination}/\""
+                rsync -ahvp --dry-run "${rsync_exclude_args[@]}" --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/"
 
                 if [ $? -ne 0 ]; then
                     unraid_notify "Rsync replication failed from source: ${source_path} to local destination: ${rsync_destination}" "failure"
@@ -440,7 +453,13 @@ rsync -avh --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/
         fi
         #
         local snapshot_mount_point="/mnt/${source_path}/.zfs/snapshot/${snapshot_name}"
-        do_rsync "${snapshot_mount_point}" "${destination}" ""
+        # Exclude child dataset from parent sync
+        for folder in $(find "${snapshot_mount_point}" -mindepth 1 -type d -printf '%f\n'); do
+          if [ $(zfs list -o name | grep -cE "^$source_path/$folder$") -eq 0 ]; then
+            echo "Folder found ! Not a child dataset. Syncing: '$folder'"
+            do_rsync "${snapshot_mount_point}/${folder}" "${destination}" ""
+          fi
+        done
         #
         echo "deleting temporary snapshot"
         zfs destroy "${source_path}@${snapshot_name}"
@@ -460,6 +479,7 @@ rsync -avh --delete $link_dest "${snapshot_mount_point}/" "${rsync_destination}/
             child_destination="${destination}/${relative_path}"
             do_rsync "${snapshot_mount_point}" "${child_destination}" "/${relative_path}"
             zfs destroy "${child_dataset}@${snapshot_name}"
+            exit
         done
         #
         # Send a single success Unraid notification after all datasets (main and child) have been processed.
